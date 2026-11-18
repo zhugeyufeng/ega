@@ -14,7 +14,9 @@ set -uo pipefail
 
 DEFAULT_HOST="outbox.ega-archive.org"
 DEFAULT_PORT="22"
-KEY_DIR="$HOME/.ssh/key"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 按顺序查找私钥的目录：脚本同目录下的 "ssh key" 文件夹、~/.ssh/key、~/.ssh
+KEY_DIRS=("$SCRIPT_DIR/ssh key" "$HOME/.ssh/key" "$HOME/.ssh")
 MIN_RCLONE="1.63"          # 1.63+ 下载时先写 .partial 临时文件，中断不会留下"假完成"文件
 
 c_red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -69,25 +71,24 @@ echo
 # -----------------------------------------------------------------------------
 # 3. 选择私钥（~/.ssh/key/ 下的文件，排除 .pub）
 # -----------------------------------------------------------------------------
-if [ -d "$KEY_DIR" ]; then
-    SEARCH_DIR="$KEY_DIR"
-else
-    c_yellow "目录 $KEY_DIR 不存在，改为在 ~/.ssh 中查找私钥。"
-    SEARCH_DIR="$HOME/.ssh"
-fi
-
-mapfile -t KEYS < <(find "$SEARCH_DIR" -maxdepth 1 -type f \
-    ! -name '*.pub' ! -name 'known_hosts*' ! -name 'config' ! -name 'authorized_keys*' \
-    | sort)
+# 只认文件头是 "-----BEGIN ... PRIVATE KEY-----" 的文件，与文件名无关
+KEYS=()
+for d in "${KEY_DIRS[@]}"; do
+    [ -d "$d" ] || continue
+    while IFS= read -r -d '' f; do
+        head -n1 "$f" 2>/dev/null | grep -qE '^-----BEGIN [A-Z ]*PRIVATE KEY-----' && KEYS+=("$f")
+    done < <(find "$d" -maxdepth 1 -type f ! -name '*.pub' -print0 | sort -z)
+done
 
 if [ "${#KEYS[@]}" -eq 0 ]; then
-    c_red "在 $SEARCH_DIR 中没有找到私钥文件。"
+    c_red "没有找到私钥文件。查找过的目录:"
+    printf '  %s\n' "${KEY_DIRS[@]}"
     exit 1
 fi
 
-c_bold "可用私钥（$SEARCH_DIR）:"
+c_bold "可用私钥:"
 for i in "${!KEYS[@]}"; do
-    printf '  %2d) %s\n' "$((i + 1))" "$(basename "${KEYS[$i]}")"
+    printf '  %2d) %s\n' "$((i + 1))" "${KEYS[$i]/#$HOME/~}"
 done
 while true; do
     read -rp "请选择私钥编号: " k
@@ -97,8 +98,14 @@ while true; do
     fi
     c_red "无效编号。"
 done
-chmod 600 "$KEY_FILE" 2>/dev/null || true
 c_green "使用私钥: $KEY_FILE"
+
+# 复制一份权限为 600 的临时私钥再使用：原文件可能是只读 444，或在 NTFS/U 盘上无法 chmod，
+# ssh-keygen 会因"权限过宽"拒绝读取。脚本退出时自动删除临时副本。
+KEY_TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$KEY_TMP_DIR"' EXIT
+install -m 600 "$KEY_FILE" "$KEY_TMP_DIR/key"
+KEY_FILE="$KEY_TMP_DIR/key"
 
 # 私钥是否带密码
 KEY_PASS_OBSCURED=""
