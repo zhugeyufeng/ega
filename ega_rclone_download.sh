@@ -17,7 +17,7 @@ DEFAULT_PORT="22"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 按顺序查找私钥的目录：脚本同目录下的 "ssh key" 文件夹、~/.ssh/key、~/.ssh
 KEY_DIRS=("$SCRIPT_DIR/ssh key" "$HOME/.ssh/key" "$HOME/.ssh")
-MIN_RCLONE="1.63"          # 1.63+ 下载时先写 .partial 临时文件，中断不会留下"假完成"文件
+MIN_RCLONE="1.64"          # 1.63+ 下载先写 .partial 临时文件；1.64+ 支持 --sftp-connections 限制连接数
 
 c_red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 c_green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -132,6 +132,27 @@ export RCLONE_SFTP_SHELL_TYPE="none"          # Outbox 不提供 shell，避免 
 export RCLONE_SFTP_DISABLE_HASHCHECK="true"   # 同上，无法远程计算 md5/sha1
 REMOTE=":sftp:"
 
+# 主机密钥校验：首次运行时用 ssh-keyscan 记录服务器公钥，之后每次都校验，
+# 防止连到伪造的服务器（同时消除 rclone 的 "No host key validation" 提示）。
+KNOWN_HOSTS="$HOME/.config/ega_rclone/known_hosts"
+mkdir -p "$(dirname "$KNOWN_HOSTS")"
+if [ ! -s "$KNOWN_HOSTS" ] || ! ssh-keygen -F "$EGA_HOST" -f "$KNOWN_HOSTS" >/dev/null 2>&1 \
+        && ! ssh-keygen -F "[$EGA_HOST]:$EGA_PORT" -f "$KNOWN_HOSTS" >/dev/null 2>&1; then
+    c_yellow "首次连接 $EGA_HOST，正在获取服务器主机密钥..."
+    if ssh-keyscan -T 15 -p "$EGA_PORT" "$EGA_HOST" 2>/dev/null >> "$KNOWN_HOSTS" && [ -s "$KNOWN_HOSTS" ]; then
+        c_green "已保存到 $KNOWN_HOSTS，服务器指纹:"
+        ssh-keygen -l -f "$KNOWN_HOSTS" 2>/dev/null | sed 's/^/    /'
+    else
+        c_yellow "获取主机密钥失败，本次不做主机密钥校验。"
+        rm -f "$KNOWN_HOSTS"
+    fi
+fi
+if [ -s "$KNOWN_HOSTS" ]; then
+    export RCLONE_SFTP_KNOWN_HOSTS_FILE="$KNOWN_HOSTS"
+else
+    export RCLONE_SFTP_KNOWN_HOSTS_FILE="none"
+fi
+
 # -----------------------------------------------------------------------------
 # 5. 列出远程文件夹并选择
 # -----------------------------------------------------------------------------
@@ -139,12 +160,21 @@ read -rp "远程起始路径（直接回车 = Outbox 根目录）: " BASE
 BASE="${BASE%/}"; BASE="${BASE#/}"
 
 c_yellow "正在连接 $EGA_USER@$EGA_HOST:$EGA_PORT 并列出文件夹..."
-LIST_OUT="$(rclone lsf "${REMOTE}${BASE}" --dirs-only --contimeout 30s 2>&1)"
-if [ $? -ne 0 ]; then
+# stdout 只有目录名；rclone 的日志/提示走 stderr，单独保存，避免混进文件夹列表
+LIST_ERR="$(mktemp)"
+LIST_OUT="$(rclone lsf "${REMOTE}${BASE}" --dirs-only --contimeout 30s 2>"$LIST_ERR")"
+LIST_RC=$?
+if [ $LIST_RC -ne 0 ]; then
     c_red "连接或列目录失败："
-    echo "$LIST_OUT"
+    cat "$LIST_ERR"
+    if grep -q 'knownhosts: key mismatch' "$LIST_ERR"; then
+        c_red "服务器主机密钥与 $KNOWN_HOSTS 中记录的不一致！"
+        c_red "如果确认是 EGA 更换了密钥，删除该文件后重新运行；否则可能存在中间人攻击。"
+    fi
+    rm -f "$LIST_ERR"
     exit 1
 fi
+rm -f "$LIST_ERR"
 mapfile -t DIRS < <(printf '%s\n' "$LIST_OUT" | sed '/^$/d; s:/$::')
 
 if [ "${#DIRS[@]}" -eq 0 ]; then
@@ -221,10 +251,23 @@ mapfile -t SELECTED < <(printf '%s\n' "${SELECTED[@]}" | awk '!seen[$0]++')
 # 6. 并发参数
 # -----------------------------------------------------------------------------
 echo
-read -rp "同时下载的文件数 --transfers [默认 8]: " TRANSFERS
-TRANSFERS="${TRANSFERS:-8}"
-read -rp "单个大文件分段线程数 --multi-thread-streams [默认 4]: " STREAMS
-STREAMS="${STREAMS:-4}"
+c_bold "并发设置（EGA Outbox 会断开过多的 SSH 连接，日志里出现 connection lost /"
+c_bold "subsystem request failed 时请调低）:"
+read_int() {  # 用法: read_int 变量名 提示 默认值
+    local v
+    while true; do
+        read -rp "$2 [默认 $3]: " v
+        v="${v:-$3}"
+        [[ "$v" =~ ^[1-9][0-9]*$ ]] && { printf -v "$1" '%s' "$v"; return; }
+        c_red "请输入正整数。"
+    done
+}
+read_int TRANSFERS   "同时下载的文件数 --transfers" 4
+read_int STREAMS     "单个大文件分段线程数 --multi-thread-streams（1 = 不分段，最稳定）" 1
+read_int CHECKERS    "同时比对文件的数量 --checkers" 4
+read_int SFTP_CONNS  "SFTP 最大连接总数 --sftp-connections（超出的请求排队等待）" 8
+export RCLONE_SFTP_CONNECTIONS="$SFTP_CONNS"
+c_green "最多同时 $SFTP_CONNS 个 SSH 连接；$TRANSFERS 个文件并行，每个文件 $STREAMS 个分段。"
 
 echo
 c_bold "下载限速 --bwlimit（所有并行下载的总速度）:"
@@ -364,7 +407,7 @@ for i in "${SELECTED[@]}"; do
     run_rclone_with_progress copy "${REMOTE}${rp}" "$local_dir" \
         --ignore-existing \
         --transfers "$TRANSFERS" \
-        --checkers 16 \
+        --checkers "$CHECKERS" \
         --multi-thread-streams "$STREAMS" \
         --multi-thread-cutoff 256M \
         "${BWLIMIT_ARGS[@]}" \
